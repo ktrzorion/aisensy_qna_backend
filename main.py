@@ -4,6 +4,7 @@ from typing import List, Optional, Dict, Any
 import uvicorn
 import os
 import subprocess
+import requests
 from dotenv import load_dotenv
 from langchain_community.document_loaders import BSHTMLLoader
 from playwright.async_api import async_playwright
@@ -71,7 +72,7 @@ async def get_user_id(x_user_id: Optional[str] = Header(None)):
     return x_user_id
 
 async def load_urls(urls, use_playwright=True):
-    """Load content from URLs using either Playwright or BeautifulSoup (async version)"""
+    """Load content from URLs using either Playwright or requests + BeautifulSoup."""
     try:
         documents = []
         
@@ -86,13 +87,19 @@ async def load_urls(urls, use_playwright=True):
                     await page.goto(url_str)
                     content = await page.content()
                     
-                    # Convert dict to Document
                     documents.append(Document(page_content=content, metadata={"source": url_str}))
 
                 await browser.close()
         else:
             for url in urls:
-                loader = BSHTMLLoader(str(url))
+                url_str = str(url)  # Ensure it's a string
+                logger.info(f"Fetching with requests: {url_str}")
+
+                response = requests.get(url_str, headers={"User-Agent": "Mozilla/5.0"})
+                response.raise_for_status()  # Raise error for failed requests
+
+                # Load the HTML content with BeautifulSoup
+                loader = BSHTMLLoader.from_string(response.text, url_str)
                 documents.extend(loader.load())
 
         return documents
