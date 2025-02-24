@@ -3,6 +3,7 @@ from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
 import uvicorn
 import os
+import subprocess
 from dotenv import load_dotenv
 from langchain_community.document_loaders import BSHTMLLoader
 from playwright.async_api import async_playwright
@@ -320,6 +321,9 @@ async def health_check():
 
 # Serve static files (HTML/CSS/JS)
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+# Ensure Playwright is installed
+subprocess.run(["playwright", "install", "--with-deps"], check=True)
 
 # Run the app
 if __name__ == "__main__":
