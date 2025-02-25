@@ -33,7 +33,7 @@ app = FastAPI(title="Web Content Q&A Tool")
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://super-naiad-7319d5.netlify.app/"],  # Adjust in production
+    allow_origins=["https://super-naiad-7319d5.netlify.app/", "https://super-naiad-7319d5.netlify.app"],  # Adjust in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
