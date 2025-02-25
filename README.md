@@ -2,8 +2,6 @@
 
 A powerful tool that allows users to scrape web content and ask questions about it using AI-powered natural language processing.
 
-![Web Content Q&A Tool](https://github.com/ktrzorion/aisensy_qna_frontend/raw/main/static/screenshot.png)
-
 ## Live Demo
 
 Try it out: [http://13.232.93.150:8001/](http://13.232.93.150:8001/)
@@ -43,8 +41,8 @@ Try it out: [http://13.232.93.150:8001/](http://13.232.93.150:8001/)
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- Node.js (optional, for development)
+- Python 3.10+
+- Docker (for deployment)
 - OpenAI API key
 
 ### Backend Setup
@@ -91,7 +89,7 @@ Try it out: [http://13.232.93.150:8001/](http://13.232.93.150:8001/)
    cd aisensy_qna_frontend
    ```
 
-2. Open `index.html` in a browser, or serve using a simple HTTP server:
+2. For development, open `index.html` in a browser, or serve using a simple HTTP server:
    ```
    # Using Python
    python -m http.server
@@ -196,6 +194,7 @@ The backend provides the following API endpoints:
 
 ### Docker Deployment
 
+#### Backend
 1. Build the Docker image:
    ```
    docker build -t aisensy_be .
@@ -206,13 +205,24 @@ The backend provides the following API endpoints:
    docker run -d --network host aisensy_be
    ```
 
+#### Frontend
+1. Build the Docker image:
+   ```
+   docker build -t aisensy_fe .
+   ```
+
+2. Run the container:
+   ```
+   docker run -d -p 8001:80 --name fe aisensy_fe
+   ```
+
 ### Server Deployment
 
 1. Set up a server with Python 3.10+
 2. Clone the repository and install dependencies
 3. Install and configure nginx as a reverse proxy
 4. Set up a systemd service to run the application
-5. Configure firewall to allow port 8000 (or your chosen port)
+5. Configure firewall to allow required ports
 
 ## License
 
