@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
 import uvicorn
@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uuid
 from fastapi.staticfiles import StaticFiles
 import shutil
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +48,12 @@ os.makedirs("static", exist_ok=True)
 # In production, this should be a proper database
 user_data = {}
 
+# Progress tracking - maps user_id to progress data
+progress_data = {}
+
+# WebSocket connections - maps user_id to active websocket connections
+active_connections = {}
+
 # Define request and response models
 class ScrapeRequest(BaseModel):
     urls: List[HttpUrl]
@@ -65,51 +72,166 @@ class Answer(BaseModel):
 class UrlsResponse(BaseModel):
     urls: List[str]
 
+class ProgressUpdate(BaseModel):
+    current: int
+    total: int
+    status: str
+    url: Optional[str] = None
+
 # Get or create user_id
 async def get_user_id(x_user_id: Optional[str] = Header(None)):
     if not x_user_id:
         x_user_id = str(uuid.uuid4())
     return x_user_id
 
-async def load_urls(urls, use_playwright=True):
+# WebSocket endpoint for progress updates
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    
+    # Store the connection
+    active_connections[user_id] = websocket
+    
+    try:
+        # Send initial progress if exists
+        if user_id in progress_data:
+            await websocket.send_json(progress_data[user_id])
+        
+        # Keep connection open to receive messages
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if user_id in active_connections:
+            del active_connections[user_id]
+
+# Function to update progress and send to client
+async def update_progress(user_id: str, current: int, total: int, status: str, url: Optional[str] = None):
+    progress = {
+        "current": current,
+        "total": total,
+        "status": status,
+        "url": url
+    }
+    
+    # Store progress data
+    progress_data[user_id] = progress
+    
+    # Send to client if websocket is connected
+    if user_id in active_connections:
+        try:
+            await active_connections[user_id].send_json(progress)
+        except Exception as e:
+            logger.error(f"Error sending progress update: {e}")
+
+async def load_urls(urls, use_playwright=True, user_id=None):
     """Load content from URLs using either Playwright or requests + BeautifulSoup."""
     try:
         documents = []
+        total_urls = len(urls)
         
         if use_playwright:
             async with async_playwright() as p:
                 browser = await p.chromium.launch()
                 page = await browser.new_page()
 
-                for url in urls:
+                for i, url in enumerate(urls):
                     url_str = str(url)  # Convert HttpUrl to string
                     logger.info(f"Fetching: {url_str}")
+                    
+                    # Update progress before starting
+                    if user_id:
+                        await update_progress(
+                            user_id=user_id,
+                            current=i,
+                            total=total_urls,
+                            status="fetching",
+                            url=url_str
+                        )
+                    
+                    # Navigate to the URL
                     await page.goto(url_str)
+                    
+                    # Wait for page to load
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except:
+                        pass  # Continue if timeout
+                    
                     content = await page.content()
                     
                     documents.append(Document(page_content=content, metadata={"source": url_str}))
+                    
+                    # Update progress after finishing this URL
+                    if user_id:
+                        await update_progress(
+                            user_id=user_id,
+                            current=i+1,
+                            total=total_urls,
+                            status="complete",
+                            url=url_str
+                        )
 
                 await browser.close()
         else:
-            for url in urls:
+            for i, url in enumerate(urls):
                 url_str = str(url)  # Ensure it's a string
                 logger.info(f"Fetching with requests: {url_str}")
+
+                # Update progress before starting
+                if user_id:
+                    await update_progress(
+                        user_id=user_id,
+                        current=i,
+                        total=total_urls,
+                        status="fetching",
+                        url=url_str
+                    )
 
                 response = requests.get(url_str, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()  # Raise error for failed requests
 
-                # Load the HTML content with BeautifulSoup
-                loader = BSHTMLLoader.from_string(response.text, url_str)
-                documents.extend(loader.load())
-
-        return documents
+                # Create a document directly instead of using BSHTMLLoader
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.text, 'html.parser')
+                # Extract text content
+                text = soup.get_text(separator='\n', strip=True)
+                documents.append(Document(page_content=text, metadata={"source": url_str}))
+                
+                # Update progress after finishing this URL
+                if user_id:
+                    await update_progress(
+                        user_id=user_id,
+                        current=i+1,
+                        total=total_urls,
+                        status="complete",
+                        url=url_str
+                    )
     except Exception as e:
         logger.error(f"Error loading URLs: {e}")
+        # Update progress with error
+        if user_id:
+            await update_progress(
+                user_id=user_id,
+                current=0,
+                total=total_urls,
+                status="error",
+                url=str(e)
+            )
         raise HTTPException(status_code=500, detail=f"Failed to load URLs: {str(e)}")
 
-def process_documents(documents):
+async def process_documents(documents, user_id=None):
     """Split documents into chunks and create embeddings"""
     try:
+        # Update progress
+        if user_id:
+            await update_progress(
+                user_id=user_id,
+                current=0,
+                total=100,
+                status="processing",
+                url="Splitting documents..."
+            )
+            
         # Split the documents into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -117,13 +239,44 @@ def process_documents(documents):
         )
         splits = text_splitter.split_documents(documents)
         
+        # Update progress
+        if user_id:
+            await update_progress(
+                user_id=user_id,
+                current=50,
+                total=100,
+                status="processing",
+                url="Creating embeddings..."
+            )
+            
         # Create embeddings and vector store
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
         vector_store = FAISS.from_documents(splits, embeddings)
         
+        # Update progress
+        if user_id:
+            await update_progress(
+                user_id=user_id,
+                current=100,
+                total=100,
+                status="complete",
+                url="Processing complete!"
+            )
+            
         return vector_store
     except Exception as e:
         logger.error(f"Error processing documents: {e}")
+        
+        # Update progress with error
+        if user_id:
+            await update_progress(
+                user_id=user_id,
+                current=0,
+                total=100,
+                status="error",
+                url=str(e)
+            )
+            
         raise HTTPException(status_code=500, detail=f"Failed to process documents: {str(e)}")
 
 def setup_qa_chain(vector_store):
@@ -173,7 +326,18 @@ async def scrape_urls(request: ScrapeRequest, user_id: str = Depends(get_user_id
     """Endpoint to scrape and process URLs"""
     try:
         logger.info(f"Scraping URLs for user {user_id}: {request.urls}")
-        documents = await load_urls(request.urls, request.use_playwright)
+        
+        # Reset progress
+        await update_progress(
+            user_id=user_id,
+            current=0,
+            total=len(request.urls),
+            status="starting",
+            url="Initializing scraper..."
+        )
+        
+        # Load URLs with progress updates
+        documents = await load_urls(request.urls, request.use_playwright, user_id)
         logger.info(f"Loaded {len(documents)} documents")
         
         # Initialize user data if not exists
@@ -196,8 +360,8 @@ async def scrape_urls(request: ScrapeRequest, user_id: str = Depends(get_user_id
         for docs_list in user_data[user_id]["url_to_docs"].values():
             all_docs.extend(docs_list)
         
-        # Create vector store and QA chain
-        vector_store = process_documents(all_docs)
+        # Create vector store and QA chain with progress updates
+        vector_store = await process_documents(all_docs, user_id)
         qa_chain = setup_qa_chain(vector_store)
         
         # Update user data
@@ -213,6 +377,16 @@ async def scrape_urls(request: ScrapeRequest, user_id: str = Depends(get_user_id
         }
     except Exception as e:
         logger.error(f"Error in scrape endpoint: {e}")
+        
+        # Update progress with error
+        await update_progress(
+            user_id=user_id,
+            current=0,
+            total=len(request.urls),
+            status="error",
+            url=str(e)
+        )
+        
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ask", response_model=Answer)
@@ -289,8 +463,17 @@ async def remove_url(request: RemoveUrlRequest, user_id: str = Depends(get_user_
         for docs_list in user_data[user_id]["url_to_docs"].values():
             all_docs.extend(docs_list)
         
+        # Update progress
+        await update_progress(
+            user_id=user_id,
+            current=0,
+            total=100,
+            status="processing",
+            url="Rebuilding index after URL removal..."
+        )
+        
         # Create vector store and QA chain
-        vector_store = process_documents(all_docs)
+        vector_store = await process_documents(all_docs, user_id)
         qa_chain = setup_qa_chain(vector_store)
         
         # Update user data
@@ -303,6 +486,16 @@ async def remove_url(request: RemoveUrlRequest, user_id: str = Depends(get_user_
         return {"message": f"Successfully removed data for URL {url_str}"}
     except Exception as e:
         logger.error(f"Error removing URL: {e}")
+        
+        # Update progress with error
+        await update_progress(
+            user_id=user_id,
+            current=0,
+            total=100,
+            status="error",
+            url=str(e)
+        )
+        
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/urls", response_model=UrlsResponse)
