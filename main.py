@@ -2,9 +2,11 @@ from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocke
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional
 import uvicorn
+import asyncio
 import os
 import subprocess
-import requests
+from bs4 import BeautifulSoup
+import aiohttp
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -122,103 +124,158 @@ async def update_progress(user_id: str, current: int, total: int, status: str, u
             logger.error(f"Error sending progress update: {e}")
 
 async def load_urls(urls, use_playwright=True, user_id=None):
-    """Load content from URLs using either Playwright or requests + BeautifulSoup."""
     try:
         documents = []
         total_urls = len(urls)
         
         if use_playwright:
+            # Launch browser with optimized settings
             async with async_playwright() as p:
-                browser = await p.chromium.launch()
-                page = await browser.new_page()
-
+                browser = await p.chromium.launch(
+                    headless=True,  # Ensure headless mode
+                    args=['--disable-gpu', '--disable-dev-shm-usage', '--disable-extensions']  # Performance args
+                )
+                
+                # Use a single browser context for all pages
+                context = await browser.new_context(
+                    java_script_enabled=True,
+                    bypass_csp=True,  # Bypass Content Security Policy
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                )
+                
+                # Process URLs concurrently with limit
+                tasks = []
                 for i, url in enumerate(urls):
-                    url_str = str(url)  # Convert HttpUrl to string
-                    logger.info(f"Fetching: {url_str}")
-                    
-                    # Update progress before starting
-                    if user_id:
-                        await update_progress(
-                            user_id=user_id,
-                            current=i,
-                            total=total_urls,
-                            status="fetching",
-                            url=url_str
-                        )
-                    
-                    # Navigate to the URL
-                    await page.goto(url_str)
-                    
-                    # Wait for page to load
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=10000)
-                    except:
-                        pass  # Continue if timeout
-                    
-                    content = await page.content()
-                    
-                    documents.append(Document(page_content=content, metadata={"source": url_str}))
-                    
-                    # Update progress after finishing this URL
-                    if user_id:
-                        await update_progress(
-                            user_id=user_id,
-                            current=i+1,
-                            total=total_urls,
-                            status="complete",
-                            url=url_str
-                        )
-
+                    url_str = str(url)
+                    tasks.append(process_url_with_playwright(context, url_str, i, total_urls, user_id))
+                
+                # Process up to 3 URLs concurrently
+                chunk_size = 3
+                for i in range(0, len(tasks), chunk_size):
+                    chunk_results = await asyncio.gather(*tasks[i:i+chunk_size])
+                    documents.extend([doc for doc in chunk_results if doc])
+                
+                await context.close()
                 await browser.close()
         else:
+            # Process URLs concurrently with requests
+            tasks = []
             for i, url in enumerate(urls):
-                url_str = str(url)  # Ensure it's a string
-                logger.info(f"Fetching with requests: {url_str}")
-
-                # Update progress before starting
-                if user_id:
-                    await update_progress(
-                        user_id=user_id,
-                        current=i,
-                        total=total_urls,
-                        status="fetching",
-                        url=url_str
-                    )
-
-                response = requests.get(url_str, headers={"User-Agent": "Mozilla/5.0"})
-                response.raise_for_status()  # Raise error for failed requests
-
-                # Create a document directly instead of using BSHTMLLoader
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(response.text, 'html.parser')
-                # Extract text content
-                text = soup.get_text(separator='\n', strip=True)
-                documents.append(Document(page_content=text, metadata={"source": url_str}))
-                
-                # Update progress after finishing this URL
-                if user_id:
-                    await update_progress(
-                        user_id=user_id,
-                        current=i+1,
-                        total=total_urls,
-                        status="complete",
-                        url=url_str
-                    )
+                url_str = str(url)
+                tasks.append(process_url_with_requests(url_str, i, total_urls, user_id))
+            
+            # Process up to 5 URLs concurrently
+            chunk_size = 5
+            for i in range(0, len(tasks), chunk_size):
+                chunk_results = await asyncio.gather(*tasks[i:i+chunk_size])
+                documents.extend([doc for doc in chunk_results if doc])
                     
-        return documents  # Add this return statement
+        return documents
         
     except Exception as e:
         logger.error(f"Error loading URLs: {e}")
-        # Update progress with error
         if user_id:
-            await update_progress(
-                user_id=user_id,
-                current=0,
-                total=total_urls,
-                status="error",
-                url=str(e)
-            )
+            await update_progress(user_id, 0, total_urls, "error", str(e))
         raise HTTPException(status_code=500, detail=f"Failed to load URLs: {str(e)}")
+    
+async def process_url_with_playwright(context, url, index, total, user_id=None):
+    try:
+        logger.info(f"Fetching with Playwright: {url}")
+        
+        if user_id:
+            await update_progress(user_id, index, total, "fetching", url)
+        
+        page = await context.new_page()
+        
+        # Set shorter timeouts
+        page.set_default_timeout(15000)  # 15 seconds for all operations
+        
+        # Navigate with timeout
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        
+        if not response or response.status >= 400:
+            logger.warning(f"Failed to load {url}: {response.status if response else 'No response'}")
+            await page.close()
+            return None
+            
+        # Wait for main content to load, but with shorter timeout
+        try:
+            # Wait for the body to be available
+            await page.wait_for_selector("body", timeout=5000)
+            
+            # Execute script to get page content
+            content = await page.content()
+            
+            # Extract main text content as a fallback
+            text_content = await page.evaluate("""() => {
+                // Try to find main content
+                const article = document.querySelector('article') || 
+                               document.querySelector('main') || 
+                               document.querySelector('.content') ||
+                               document.querySelector('#content');
+                               
+                return article ? article.innerText : document.body.innerText;
+            }""")
+            
+            # Close the page
+            await page.close()
+            
+            if user_id:
+                await update_progress(user_id, index+1, total, "complete", url)
+            
+            # Return combined document
+            return Document(
+                page_content=text_content, 
+                metadata={"source": url, "html": content[:10000]}  # Store some HTML for context
+            )
+            
+        except Exception as e:
+            logger.warning(f"Error extracting content from {url}: {e}")
+            await page.close()
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error processing {url} with Playwright: {e}")
+        if user_id:
+            await update_progress(user_id, index, total, "error", f"{url}: {str(e)}")
+        return None
+    
+# Helper function for processing a URL with requests
+async def process_url_with_requests(url, index, total, user_id=None):
+    try:
+        logger.info(f"Fetching with requests: {url}")
+        
+        if user_id:
+            await update_progress(user_id, index, total, "fetching", url)
+        
+        # Use aiohttp instead of requests for async
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15) as response:
+                if response.status >= 400:
+                    logger.warning(f"Failed to load {url}: {response.status}")
+                    return None
+                    
+                html = await response.text()
+                
+                # Process with BeautifulSoup
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                # Try to find main content
+                main_content = soup.find('article') or soup.find('main') or soup.find('.content') or soup.find('#content')
+                
+                # Extract text content
+                text = (main_content or soup).get_text(separator='\n', strip=True)
+                
+                if user_id:
+                    await update_progress(user_id, index+1, total, "complete", url)
+                
+                return Document(page_content=text, metadata={"source": url})
+                
+    except Exception as e:
+        logger.error(f"Error processing {url} with requests: {e}")
+        if user_id:
+            await update_progress(user_id, index, total, "error", f"{url}: {str(e)}")
+        return None
 
 async def process_documents(documents, user_id=None):
     """Split documents into chunks and create embeddings"""
