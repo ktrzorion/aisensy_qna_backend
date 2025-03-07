@@ -282,44 +282,60 @@ async def process_documents(documents, user_id=None):
     try:
         # Update progress
         if user_id:
-            await update_progress(
-                user_id=user_id,
-                current=0,
-                total=100,
-                status="processing",
-                url="Splitting documents..."
-            )
+            await update_progress(user_id, 0, 100, "processing", "Splitting documents...")
             
-        # Split the documents into chunks
+        # Optimize text splitting with more selective content
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
-            chunk_overlap=200
+            chunk_overlap=100,  # Reduced overlap
+            separators=["\n\n", "\n", ". ", " ", ""]  # Explicit separators
         )
-        splits = text_splitter.split_documents(documents)
         
-        # Update progress
-        if user_id:
-            await update_progress(
-                user_id=user_id,
-                current=50,
-                total=100,
-                status="processing",
-                url="Creating embeddings..."
-            )
+        # Process in smaller batches to avoid memory issues
+        all_splits = []
+        batch_size = 10
+        
+        for i in range(0, len(documents), batch_size):
+            batch = documents[i:i+batch_size]
+            splits = text_splitter.split_documents(batch)
+            all_splits.extend(splits)
             
-        # Create embeddings and vector store
-        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-        vector_store = FAISS.from_documents(splits, embeddings)
+            # Update progress periodically
+            if user_id:
+                progress = min(40, int(40 * (i + batch_size) / len(documents)))
+                await update_progress(user_id, progress, 100, "processing", f"Splitting documents: {i+batch_size}/{len(documents)}")
         
         # Update progress
         if user_id:
-            await update_progress(
-                user_id=user_id,
-                current=100,
-                total=100,
-                status="complete",
-                url="Processing complete!"
-            )
+            await update_progress(user_id, 50, 100, "processing", "Creating embeddings...")
+        
+        # Use a smaller, faster embedding model
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",  # Smaller, faster model
+            cache_folder="embeddings_cache"  # Cache embeddings
+        )
+        
+        # Create vector store in batches
+        vector_store = None
+        batch_size = 100  # Process 100 splits at a time
+        
+        for i in range(0, len(all_splits), batch_size):
+            batch = all_splits[i:i+batch_size]
+            
+            if vector_store is None:
+                vector_store = FAISS.from_documents(batch, embeddings)
+            else:
+                batch_vector = FAISS.from_documents(batch, embeddings)
+                vector_store.merge_from(batch_vector)
+            
+            # Update progress periodically
+            if user_id:
+                progress = 50 + min(50, int(50 * (i + batch_size) / len(all_splits)))
+                await update_progress(user_id, progress, 100, "processing", f"Creating embeddings: {i+batch_size}/{len(all_splits)}")
+        
+        # Update progress
+        if user_id:
+            await update_progress(user_id, 100, 100, "complete", "Processing complete!")
             
         return vector_store
     except Exception as e:
@@ -327,13 +343,7 @@ async def process_documents(documents, user_id=None):
         
         # Update progress with error
         if user_id:
-            await update_progress(
-                user_id=user_id,
-                current=0,
-                total=100,
-                status="error",
-                url=str(e)
-            )
+            await update_progress(user_id, 0, 100, "error", str(e))
             
         raise HTTPException(status_code=500, detail=f"Failed to process documents: {str(e)}")
 
