@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 import uvicorn
 import os
 import subprocess
 import requests
 from dotenv import load_dotenv
-from langchain_community.document_loaders import BSHTMLLoader
 from playwright.async_api import async_playwright
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -19,7 +18,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import uuid
 from fastapi.staticfiles import StaticFiles
 import shutil
-import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -206,6 +204,9 @@ async def load_urls(urls, use_playwright=True, user_id=None):
                         status="complete",
                         url=url_str
                     )
+                    
+        return documents  # Add this return statement
+        
     except Exception as e:
         logger.error(f"Error loading URLs: {e}")
         # Update progress with error
