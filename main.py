@@ -284,7 +284,8 @@ def setup_qa_chain(vector_store):
     """Set up the QA chain with the vector store"""
     try:
         # Initialize OpenAI LLM (ensure OPENAI_API_KEY is set in .env)
-        llm = OpenAI(temperature=0)
+        # llm = OpenAI(temperature=0)
+        llm = OpenAI(temperature=0, model_name="gpt-4")
         
         # Create the retrieval QA chain
         qa_chain = RetrievalQA.from_chain_type(
